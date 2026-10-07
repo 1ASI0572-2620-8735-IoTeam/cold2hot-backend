@@ -33,11 +33,31 @@ app.get('/', (req, res) => {
 });
 
 // Enrutamiento inverso hacia Microservicios
-app.use('/api/v1/iam', createProxyMiddleware({ target: IAM_SERVICE_URL, changeOrigin: true }));
-app.use('/api/v1/telemetry', createProxyMiddleware({ target: TELEMETRY_SERVICE_URL, changeOrigin: true }));
-app.use('/api/v1/containers', createProxyMiddleware({ target: CONTAINER_SERVICE_URL, changeOrigin: true }));
-app.use('/api/v1/security', createProxyMiddleware({ target: SECURITY_SERVICE_URL, changeOrigin: true }));
-app.use('/api/v1/orders', createProxyMiddleware({ target: ORDERS_SERVICE_URL, changeOrigin: true }));
+app.use('/api/v1/iam', createProxyMiddleware({
+  target: IAM_SERVICE_URL,
+  changeOrigin: true,
+  pathRewrite: { '^/api/v1/iam': '' }
+}));
+app.use('/api/v1/telemetry', createProxyMiddleware({
+  target: TELEMETRY_SERVICE_URL,
+  changeOrigin: true,
+  pathRewrite: { '^/api/v1/telemetry': '' }
+}));
+app.use('/api/v1/containers', createProxyMiddleware({
+  target: CONTAINER_SERVICE_URL,
+  changeOrigin: true,
+  pathRewrite: { '^/api/v1/containers': '' }
+}));
+app.use('/api/v1/security', createProxyMiddleware({
+  target: SECURITY_SERVICE_URL,
+  changeOrigin: true,
+  pathRewrite: { '^/api/v1/security': '' }
+}));
+app.use('/api/v1/orders', createProxyMiddleware({
+  target: ORDERS_SERVICE_URL,
+  changeOrigin: true,
+  pathRewrite: { '^/api/v1/orders': '' }
+}));
 
 app.listen(PORT, () => {
   console.log(`[API-GATEWAY] Cold2Hot API Gateway escuchando en el puerto ${PORT}`);

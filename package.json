@@ -1,0 +1,18 @@
+{
+  "name": "cold2hot-backend",
+  "version": "1.0.0",
+  "description": "Cold2Hot Cloud Backend Microservices Suite",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "docker:up": "docker compose up --build",
+    "docker:down": "docker compose down"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "http-proxy-middleware": "^3.0.3",
+    "morgan": "^1.10.0",
+    "swagger-ui-express": "^5.0.1"
+  }
+}

@@ -1,0 +1,12 @@
+services:
+  # Cold2Hot Microservices Cloud Suite (API Gateway + Microservicios integrados)
+  - type: web
+    name: cold2hot-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
