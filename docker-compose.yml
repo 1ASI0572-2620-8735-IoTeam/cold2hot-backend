@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  api-gateway:
+    build: ./api-gateway
+    container_name: cold2hot-api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - IAM_SERVICE_URL=http://iam-service:3001
+      - TELEMETRY_SERVICE_URL=http://telemetry-service:3002
+    depends_on:
+      - iam-service
+      - telemetry-service
+    networks:
+      - cold2hot-network
+
+  iam-service:
+    build: ./iam-service
+    container_name: cold2hot-iam-service
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+    networks:
+      - cold2hot-network
+
+  telemetry-service:
+    build: ./telemetry-service
+    container_name: cold2hot-telemetry-service
+    ports:
+      - "3002:3002"
+    environment:
+      - PORT=3002
+    networks:
+      - cold2hot-network
+
+networks:
+  cold2hot-network:
+    driver: bridge

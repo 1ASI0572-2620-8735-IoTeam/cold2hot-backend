@@ -1,0 +1,14 @@
+{
+  "name": "cold2hot-iam-service",
+  "version": "1.0.0",
+  "description": "Microservicio de Identidad y Acceso (IAM) para Cold2Hot",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "swagger-ui-express": "^5.0.1"
+  }
+}

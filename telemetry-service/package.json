@@ -1,0 +1,14 @@
+{
+  "name": "cold2hot-telemetry-service",
+  "version": "1.0.0",
+  "description": "Microservicio de Telemetría Térmica e Ingesta IoT para Cold2Hot",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "swagger-ui-express": "^5.0.1"
+  }
+}
