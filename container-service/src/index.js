@@ -18,8 +18,8 @@ const LOW_BATTERY_THRESHOLD = 15;
 
 const seed = () => ({
   smartboxes: [
-    { boxId: 'SB-014', serialNumber: 'C2H-SN-0014', macAddress: 'A4:CF:12:9B:3E:01', maxWeightKg: 8, status: 'AVAILABLE', deviceId: 'ESP32-014', batteryLevel: 82, isOnline: true, lastHeartbeat: new Date().toISOString() },
-    { boxId: 'SB-022', serialNumber: 'C2H-SN-0022', macAddress: 'A4:CF:12:9B:3E:02', maxWeightKg: 8, status: 'AVAILABLE', deviceId: 'ESP32-022', batteryLevel: 64, isOnline: true, lastHeartbeat: new Date().toISOString() },
+    { boxId: 'SB-014', serialNumber: 'C2H-SN-0014', macAddress: 'A4:CF:12:9B:3E:01', maxWeightKg: 8, status: 'IN_TRANSIT', deviceId: 'ESP32-014', batteryLevel: 82, isOnline: true, lastHeartbeat: new Date().toISOString() },
+    { boxId: 'SB-022', serialNumber: 'C2H-SN-0022', macAddress: 'A4:CF:12:9B:3E:02', maxWeightKg: 8, status: 'IN_TRANSIT', deviceId: 'ESP32-022', batteryLevel: 64, isOnline: true, lastHeartbeat: new Date().toISOString() },
     { boxId: 'SB-007', serialNumber: 'C2H-SN-0007', macAddress: 'A4:CF:12:9B:3E:03', maxWeightKg: 10, status: 'AVAILABLE', deviceId: 'ESP32-007', batteryLevel: 12, isOnline: true, lastHeartbeat: new Date().toISOString() },
     { boxId: 'SB-031', serialNumber: 'C2H-SN-0031', macAddress: 'A4:CF:12:9B:3E:04', maxWeightKg: 10, status: 'AVAILABLE', deviceId: null, batteryLevel: 100, isOnline: false, lastHeartbeat: null }
   ],

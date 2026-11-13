@@ -9,26 +9,27 @@ const temps = {};
 
 const tick = async () => {
   try {
-    const res = await fetch(`${GATEWAY}/api/v1/orders/shipments?status=IN_TRANSIT`);
+    const res = await fetch(`${GATEWAY}/api/v1/orders?status=IN_TRANSIT`);
     const shipments = await res.json();
     for (const s of shipments) {
-      const mid = (s.minTemp + s.maxTemp) / 2;
-      const prev = temps[s.shipmentId] ?? mid;
+      const { minTemperature: lo, maxTemperature: hi } = s.thermalProfile;
+      const mid = (lo + hi) / 2;
+      const prev = temps[s.orderId] ?? mid;
       // Ruido con reversión a la media: casi siempre en rango y, de vez en cuando, un desvío
-      const spike = Math.random() < 0.03 ? (Math.random() < 0.5 ? -1 : 1) * (s.maxTemp - s.minTemp) * 0.8 : 0;
+      const spike = Math.random() < 0.03 ? (Math.random() < 0.5 ? -1 : 1) * (hi - lo) * 0.8 : 0;
       const next = Math.round((prev + (mid - prev) * 0.25 + (Math.random() - 0.5) * 1.2 + spike) * 10) / 10;
-      temps[s.shipmentId] = next;
+      temps[s.orderId] = next;
       await fetch(`${GATEWAY}/api/v1/telemetry/ingest`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ smartBoxId: s.smartBoxId, shipmentId: s.shipmentId, temperature: next, lidOpen: false })
+        body: JSON.stringify({ smartBoxId: s.smartBoxId, shipmentId: s.orderId, temperature: next, lidOpen: false })
       });
       await fetch(`${GATEWAY}/api/v1/containers/devices/heartbeat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ boxId: s.smartBoxId, batteryLevel: 80 })
       });
-      console.log(`[SIM] ${s.shipmentId} ${s.smartBoxId} -> ${next}°C`);
+      console.log(`[SIM] ${s.orderId} ${s.smartBoxId} -> ${next}°C`);
     }
   } catch (e) {
     console.warn('[SIM] Gateway no disponible:', e.message);
