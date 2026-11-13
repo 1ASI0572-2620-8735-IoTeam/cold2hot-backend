@@ -31,6 +31,19 @@ Una vez levantado:
 
 ---
 
+## 🧪 Pruebas automatizadas
+
+La suite usa el runner nativo de Node (`node:test`), sin dependencias adicionales (Node 20 o superior).
+
+```bash
+npm test          # unitarias + integración (45 pruebas)
+npm run test:unit # solo reglas de negocio puras
+```
+
+- `tests/unit.test.js`: reglas puras del Security Service (evaluación de OTP, lógica de dos niveles de apertura, utilidades).
+- `tests/integration.test.js`: levanta el orquestador completo (5 microservicios y API Gateway) en puertos libres, con archivos de datos temporales y sin `DATABASE_URL`, y recorre los flujos de las historias US03, US04, US05, US07, US09, US10, US11, US12, US13, US14, US16, US17 y US20 a través del Gateway.
+- Las pruebas no tocan Supabase ni dejan datos en `data/`. El workflow `.github/workflows/test.yml` las ejecuta en cada push y Pull Request a `master` y `develop`.
+
 ## 🗄️ Persistencia (PostgreSQL / Supabase)
 
 Con `DATABASE_URL` definida, cada microservicio guarda sus datos en **tablas relacionales propias** (prefijo por servicio). El DDL de cada uno está en `<servicio>/src/schema.sql`, es idempotente y **se aplica solo al arrancar**: no hay que correr migraciones a mano. Sin `DATABASE_URL`, el servicio usa un archivo JSON local (`<servicio>/data/db.json`), pensado solo para desarrollo.
