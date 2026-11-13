@@ -6,18 +6,20 @@
  */
 const crypto = require('crypto');
 
-const BASE = (process.env.SUPABASE_URL || '').replace(/\/+$/, '');
-const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '';
+// trim: un espacio o salto de línea al pegar la clave en el panel la invalida
+const BASE = (process.env.SUPABASE_URL || '').trim().replace(/\/+$/, '');
+const KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY || '').trim();
 const BUCKET = process.env.EVIDENCE_BUCKET || 'delivery-evidence';
 const MAX_BYTES = 5 * 1024 * 1024;
 const TYPES = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
 
 const enabled = Boolean(BASE && KEY);
 
-// Las claves nuevas (sb_secret_...) no son JWT: van solo en el header apikey
+// Storage exige Authorization; el gateway de Supabase acepta ahí tanto la clave service_role (JWT)
+// como una secret key sb_secret_... siempre que vaya también en apikey
 const headers = (extra = {}) => ({
   apikey: KEY,
-  ...(KEY.startsWith('eyJ') ? { Authorization: `Bearer ${KEY}` } : {}),
+  Authorization: `Bearer ${KEY}`,
   ...extra
 });
 
