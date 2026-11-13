@@ -1,68 +1,62 @@
 /**
- * Persistencia opcional en PostgreSQL (Supabase).
- * Si DATABASE_URL está definida, el estado del servicio se guarda como un documento JSONB en la tabla
- * public.service_state y sobrevive a los redeploys. Sin DATABASE_URL no hace nada y el servicio sigue
- * usando su archivo JSON local.
+ * Conexión opcional a PostgreSQL (Supabase).
+ * Con DATABASE_URL el servicio trabaja sobre sus tablas relacionales (definidas en src/schema.sql);
+ * sin ella usa su archivo JSON local, pensado solo para desarrollo.
+ *
+ * DATABASE_SCHEMA permite usar otro esquema del mismo proyecto (p. ej. pruebas); por defecto `public`.
  */
+const fs = require('fs');
+const path = require('path');
+
 let pool = null;
+const SCHEMA = process.env.DATABASE_SCHEMA || 'public';
+if (!/^[a-z_][a-z0-9_]*$/.test(SCHEMA)) throw new Error('DATABASE_SCHEMA inválido');
+
 if (process.env.DATABASE_URL) {
   const { Pool } = require('pg');
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
-    max: 2
+    max: Number(process.env.DATABASE_POOL_MAX) || 2,
+    ...(SCHEMA !== 'public' ? { options: `-c search_path=${SCHEMA},public` } : {})
   });
   pool.on('error', (e) => console.warn('[PG] conexión inactiva falló:', e.message));
 }
 
-/**
- * @param {string} name  clave del servicio (fila de service_state)
- * @param {() => object} get  devuelve el estado actual en memoria
- * @param {(doc: object) => void} set  reemplaza el estado en memoria
- */
-function attach(name, get, set) {
-  if (!pool) return { push() {} };
-  let ready = false;
-  let timer = null;
-  let dirty = false;
-
-  const flush = async () => {
-    timer = null;
-    if (!ready || !dirty) return;
-    dirty = false;
-    try {
-      await pool.query(
-        'insert into public.service_state (service, data, updated_at) values ($1, $2, now()) ' +
-          'on conflict (service) do update set data = excluded.data, updated_at = now()',
-        [name, JSON.stringify(get())]
-      );
-    } catch (e) {
-      dirty = true;
-      console.warn(`[PG] no se pudo guardar ${name}:`, e.message);
-    }
-  };
-
-  // Carga inicial: si ya hay un documento en la base, manda sobre el seed local.
-  (async () => {
-    try {
-      const r = await pool.query('select data from public.service_state where service = $1', [name]);
-      if (r.rows.length) set(r.rows[0].data);
-      else dirty = true;
-      console.log(`[PG] ${name}: ${r.rows.length ? 'estado cargado desde la base' : 'sin estado previo, se guardará el inicial'}`);
-    } catch (e) {
-      console.warn(`[PG] no se pudo cargar ${name}; se sigue con el archivo local:`, e.message);
-      return;
-    }
-    ready = true;
-    flush();
-  })();
-
-  return {
-    push() {
-      dirty = true;
-      if (!timer) timer = setTimeout(flush, 1000);
-    }
-  };
+/** Aplica el DDL idempotente del servicio (create ... if not exists). */
+async function migrate() {
+  const sql = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
+  if (SCHEMA !== 'public') await pool.query(`create schema if not exists ${SCHEMA}`);
+  await pool.query(sql);
 }
 
-module.exports = { attach };
+/**
+ * Documento JSONB que el servicio guardaba en public.service_state antes de pasar a tablas.
+ * Se usa una sola vez, para importar los datos cuando las tablas están vacías.
+ */
+async function legacyState(service) {
+  try {
+    const { rows } = await pool.query('select data from public.service_state where service = $1', [service]);
+    return rows[0] ? rows[0].data : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Ejecuta fn(client) dentro de una transacción. */
+async function tx(fn) {
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+    const result = await fn(client);
+    await client.query('commit');
+    return result;
+  } catch (e) {
+    await client.query('rollback').catch(() => {});
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { pool, migrate, legacyState, tx };

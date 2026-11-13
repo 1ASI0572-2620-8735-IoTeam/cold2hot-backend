@@ -364,8 +364,9 @@ app.get('/health', (req, res) => {
 });
 
 if (repo) {
-  repo
-    .seedIfEmpty(seed())
+  require('./store')
+    .migrate()
+    .then(() => repo.seedIfEmpty(seed()))
     .then((seeded) => console.log(`[TELEMETRY-SERVICE] PostgreSQL listo${seeded ? ' (datos iniciales cargados)' : ''}`))
     .catch((e) => console.error('[TELEMETRY-SERVICE] No se pudo inicializar PostgreSQL:', e.message));
 }
