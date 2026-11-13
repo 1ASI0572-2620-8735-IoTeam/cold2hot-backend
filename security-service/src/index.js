@@ -220,6 +220,16 @@ app.post('/otp', (req, res) => {
   res.status(201).json(otp);
 });
 
+// Consulta del OTP vigente de un envío (soporte al cliente)
+app.get('/otp', (req, res) => {
+  const id = String(req.query.orderId || '').replace(/^#/, '');
+  if (!id) return res.status(400).json({ error: 'orderId requerido' });
+  const otp = [...db.otps].reverse().find((o) => String(o.orderId).replace(/^#/, '') === id);
+  if (!otp) return res.status(404).json({ error: 'Sin OTP para este envío' });
+  const state = otp.used ? 'USED' : otp.revoked ? 'REVOKED' : new Date(otp.expiresAt) < new Date() ? 'EXPIRED' : 'ACTIVE';
+  res.json({ orderId: otp.orderId, code: otp.code, state, createdAt: otp.createdAt, expiresAt: otp.expiresAt });
+});
+
 app.post('/otp/validate', (req, res) => {
   const { orderId, smartBoxId, code } = req.body || {};
   if (!smartBoxId || !code) return res.status(400).json({ error: 'smartBoxId y code requeridos' });
