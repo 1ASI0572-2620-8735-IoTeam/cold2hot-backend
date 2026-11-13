@@ -55,7 +55,10 @@ const load = () => {
 };
 
 let db = load();
-const remote = require('./store').attach('telemetry', () => db, (d) => { db = d; });
+const { pool } = require('./store');
+// Con DATABASE_URL se usan las tablas relacionales; sin ella, el JSON local (desarrollo).
+const repo = pool ? require('./pgrepo')(pool) : null;
+const remote = { push() {} };
 
 const save = () => {
   remote.push();
@@ -68,11 +71,18 @@ const save = () => {
 };
 
 // Perfil activo: por envío si viene; si no, el último activo de la caja
-const activeProfile = ({ orderId, smartBoxId }) => {
+const memActiveProfile = ({ orderId, smartBoxId }) => {
   const list = db.profiles.filter((p) => p.active);
   if (orderId) return list.find((p) => p.orderId === orderId) || null;
   return list.filter((p) => p.smartBoxId === smartBoxId).pop() || null;
 };
+const activeProfile = async (q) => (repo ? repo.activeProfile(q) : memActiveProfile(q));
+
+// Express 4 no captura rechazos de handlers async
+const h = (fn) => (req, res) => Promise.resolve(fn(req, res)).catch((e) => {
+  console.error('[TELEMETRY-SERVICE]', e.message);
+  res.status(500).json({ error: 'Error interno de telemetría' });
+});
 
 // Swagger
 const json = (schema) => ({ required: true, content: { 'application/json': { schema } } });
@@ -174,7 +184,7 @@ const swaggerDocument = {
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 // Perfiles térmicos
-app.post('/thermal-profiles', (req, res) => {
+app.post('/thermal-profiles', h(async (req, res) => {
   const { orderId, smartBoxId, type, minTemperature, maxTemperature } = req.body || {};
   if (!orderId || !smartBoxId || !THERMAL_DEFAULTS[type]) {
     return res.status(400).json({ error: 'orderId, smartBoxId y type (COLD|HOT) requeridos' });
@@ -184,28 +194,31 @@ app.post('/thermal-profiles', (req, res) => {
   if (Number(min) >= Number(max)) return res.status(400).json({ error: 'minTemperature debe ser menor que maxTemperature' });
 
   const id = normId(orderId);
+  const data = { profileId: 'TP-' + id, orderId: id, smartBoxId, type, minTemperature: Number(min), maxTemperature: Number(max) };
+  if (repo) return res.status(201).json(await repo.createProfile(data));
+
   // Una caja solo tiene un perfil activo a la vez
   db.profiles.forEach((p) => {
     if (p.active && (p.smartBoxId === smartBoxId || p.orderId === id)) p.active = false;
   });
-
-  const profile = { profileId: 'TP-' + id, orderId: id, smartBoxId, type, minTemperature: Number(min), maxTemperature: Number(max), active: true, createdAt: now() };
+  const profile = { ...data, active: true, createdAt: now() };
   db.profiles.push(profile);
   save();
   res.status(201).json(profile);
-});
+}));
 
-app.get('/thermal-profiles', (req, res) => {
+app.get('/thermal-profiles', h(async (req, res) => {
   const { active } = req.query;
+  if (repo) return res.json(await repo.listProfiles(active));
   res.json(db.profiles.filter((p) => active === undefined || String(p.active) === active));
-});
+}));
 
-app.get('/thermal-profiles/orders/:orderId', (req, res) => {
+app.get('/thermal-profiles/orders/:orderId', h(async (req, res) => {
   const id = normId(req.params.orderId);
-  const profile = db.profiles.filter((p) => p.orderId === id).pop();
+  const profile = repo ? await repo.profileByOrder(id) : db.profiles.filter((p) => p.orderId === id).pop();
   if (!profile) return res.status(404).json({ error: 'Perfil térmico no encontrado' });
   res.json(profile);
-});
+}));
 
 // Aviso a security-service cuando cambia el estado de la tapa (apertura/cierre)
 const SECURITY_URL = process.env.SECURITY_SERVICE_URL || 'http://localhost:3004';
@@ -224,56 +237,66 @@ const notifyLid = (smartBoxId, orderId, lidOpen) => {
 };
 
 // Ingesta + evaluación
-app.post('/ingest', (req, res) => {
+app.post('/ingest', h(async (req, res) => {
   const { smartBoxId, shipmentId, temperature, lidOpen } = req.body || {};
   const temp = Number(temperature);
   if (!smartBoxId || temperature === undefined || !Number.isFinite(temp)) {
     return res.status(400).json({ error: 'smartBoxId y temperature (número) son obligatorios' });
   }
 
-  const profile = activeProfile({ orderId: normId(shipmentId), smartBoxId });
+  const profile = await activeProfile({ orderId: normId(shipmentId), smartBoxId });
   const inRange = profile ? temp >= profile.minTemperature && temp <= profile.maxTemperature : null;
+  const orderRef = profile?.orderId || normId(shipmentId) || 'UNASSIGNED';
 
-  const log = {
-    id: 'TLOG-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
-    smartBoxId,
-    shipmentId: profile?.orderId || normId(shipmentId) || 'UNASSIGNED',
-    temperature: temp,
-    lidOpen: !!lidOpen,
-    inRange,
-    timestamp: now()
-  };
-  db.logs.unshift(log);
+  let log;
+  if (repo) {
+    log = await repo.insertReading({ smartBoxId, shipmentId: orderRef, temperature: temp, lidOpen: !!lidOpen, inRange });
+  } else {
+    log = {
+      id: 'TLOG-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+      smartBoxId,
+      shipmentId: orderRef,
+      temperature: temp,
+      lidOpen: !!lidOpen,
+      inRange,
+      timestamp: now()
+    };
+    db.logs.unshift(log);
+    if (db.logs.length > MAX_LOGS) db.logs.length = MAX_LOGS;
+  }
   notifyLid(smartBoxId, log.shipmentId === 'UNASSIGNED' ? null : log.shipmentId, !!lidOpen);
-  if (db.logs.length > MAX_LOGS) db.logs.length = MAX_LOGS;
 
   let alert = null;
   if (profile && !inRange) {
     // Una sola alerta abierta por envío: se actualiza con la última lectura
-    alert = db.alerts.find((a) => a.orderId === profile.orderId && a.type === 'THERMAL_BREACH' && !a.resolved);
     const message = `Temperatura fuera de rango (${temp}°C, permitido ${profile.minTemperature}–${profile.maxTemperature}°C)`;
-    if (alert) {
-      Object.assign(alert, { temperature: temp, message, lastSeenAt: log.timestamp, readingsOutOfRange: (alert.readingsOutOfRange || 1) + 1 });
+    if (repo) {
+      alert = await repo.upsertBreach({ orderId: profile.orderId, smartBoxId, temperature: temp, min: profile.minTemperature, max: profile.maxTemperature, message });
     } else {
-      alert = {
-        alertId: 'ALT-TMP-' + Date.now(),
-        type: 'THERMAL_BREACH',
-        severity: 'CRITICAL',
-        orderId: profile.orderId,
-        smartBoxId,
-        temperature: temp,
-        minTemperature: profile.minTemperature,
-        maxTemperature: profile.maxTemperature,
-        message,
-        readingsOutOfRange: 1,
-        resolved: false,
-        timestamp: log.timestamp
-      };
-      db.alerts.push(alert);
+      alert = db.alerts.find((a) => a.orderId === profile.orderId && a.type === 'THERMAL_BREACH' && !a.resolved);
+      if (alert) {
+        Object.assign(alert, { temperature: temp, message, lastSeenAt: log.timestamp, readingsOutOfRange: (alert.readingsOutOfRange || 1) + 1 });
+      } else {
+        alert = {
+          alertId: 'ALT-TMP-' + Date.now(),
+          type: 'THERMAL_BREACH',
+          severity: 'CRITICAL',
+          orderId: profile.orderId,
+          smartBoxId,
+          temperature: temp,
+          minTemperature: profile.minTemperature,
+          maxTemperature: profile.maxTemperature,
+          message,
+          readingsOutOfRange: 1,
+          resolved: false,
+          timestamp: log.timestamp
+        };
+        db.alerts.push(alert);
+      }
     }
   }
 
-  save();
+  if (!repo) save();
   res.status(201).json({
     message: 'Telemetría recibida con éxito',
     log,
@@ -282,51 +305,70 @@ app.post('/ingest', (req, res) => {
       : { status: 'NO_ACTIVE_PROFILE' },
     alert
   });
-});
+}));
 
-// Consultas
-const filterLogs = ({ orderId, smartBoxId }) =>
-  db.logs.filter((l) => (!orderId || l.shipmentId === normId(orderId)) && (!smartBoxId || l.smartBoxId === smartBoxId));
+// Consultas (lecturas más recientes primero)
+const queryLogs = async ({ orderId, smartBoxId, limit }) =>
+  repo
+    ? repo.logs({ orderId: orderId ? normId(orderId) : null, smartBoxId, limit })
+    : db.logs.filter((l) => (!orderId || l.shipmentId === normId(orderId)) && (!smartBoxId || l.smartBoxId === smartBoxId)).slice(0, limit);
 
-app.get('/logs', (req, res) => {
+app.get('/logs', h(async (req, res) => {
   const limit = Number(req.query.limit) || 100;
-  const logs = filterLogs(req.query).slice(0, limit);
+  const logs = await queryLogs({ ...req.query, limit });
   res.json({ total: logs.length, logs });
-});
+}));
 
-app.get('/boxes/:boxId/current', (req, res) => {
-  const last = filterLogs({ smartBoxId: req.params.boxId })[0];
+app.get('/boxes/:boxId/current', h(async (req, res) => {
+  const last = (await queryLogs({ smartBoxId: req.params.boxId, limit: 1 }))[0];
   if (!last) return res.status(404).json({ error: 'Sin lecturas para esta SmartBox' });
-  res.json({ ...last, activeProfile: activeProfile({ smartBoxId: req.params.boxId }) });
-});
+  res.json({ ...last, activeProfile: await activeProfile({ smartBoxId: req.params.boxId }) });
+}));
 
-app.get('/boxes/:boxId/history', (req, res) => {
+app.get('/boxes/:boxId/history', h(async (req, res) => {
   const limit = Number(req.query.limit) || 60;
-  const history = filterLogs({ smartBoxId: req.params.boxId, orderId: req.query.orderId }).slice(0, limit).reverse();
+  const history = (await queryLogs({ smartBoxId: req.params.boxId, orderId: req.query.orderId, limit })).reverse();
   res.json({ smartBoxId: req.params.boxId, total: history.length, history });
-});
+}));
 
-app.get('/alerts', (req, res) => {
+app.get('/alerts', h(async (req, res) => {
   const { resolved, orderId } = req.query;
+  const limit = Number(req.query.limit) || 500;
+  if (repo) return res.json(await repo.alerts({ resolved, orderId: orderId ? normId(orderId) : null, limit }));
   res.json(
     db.alerts
       .filter((a) => (resolved === undefined || String(a.resolved) === resolved) && (!orderId || a.orderId === normId(orderId)))
-      .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+      .sort((x, y) => y.timestamp.localeCompare(x.timestamp))
+      .slice(0, limit)
   );
-});
+}));
 
-app.patch('/alerts/:alertId/resolve', (req, res) => {
-  const alert = db.alerts.find((a) => a.alertId === req.params.alertId);
+app.patch('/alerts/:alertId/resolve', h(async (req, res) => {
+  let alert;
+  if (repo) {
+    alert = await repo.resolveAlert(req.params.alertId);
+  } else {
+    alert = db.alerts.find((a) => a.alertId === req.params.alertId);
+    if (alert) {
+      alert.resolved = true;
+      alert.resolvedAt = now();
+      save();
+    }
+  }
   if (!alert) return res.status(404).json({ error: 'Alerta no encontrada' });
-  alert.resolved = true;
-  alert.resolvedAt = now();
-  save();
   res.json(alert);
-});
+}));
 
 app.get('/health', (req, res) => {
   res.json({ service: 'telemetry-service', status: 'UP', timestamp: now() });
 });
+
+if (repo) {
+  repo
+    .seedIfEmpty(seed())
+    .then((seeded) => console.log(`[TELEMETRY-SERVICE] PostgreSQL listo${seeded ? ' (datos iniciales cargados)' : ''}`))
+    .catch((e) => console.error('[TELEMETRY-SERVICE] No se pudo inicializar PostgreSQL:', e.message));
+}
 
 app.listen(PORT, () => {
   console.log(`[TELEMETRY-SERVICE] Escuchando en el puerto ${PORT}. Swagger disponible en http://localhost:${PORT}/docs`);

@@ -65,4 +65,4 @@ function attach(name, get, set) {
   };
 }
 
-module.exports = { attach };
+module.exports = { attach, pool };
