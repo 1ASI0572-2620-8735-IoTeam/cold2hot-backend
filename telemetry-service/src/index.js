@@ -175,9 +175,11 @@ app.get('/shipments/:id/latest', (req, res) => {
 
 app.get('/shipments/:id/history', (req, res) => {
   const { from, to } = req.query;
-  const history = db.logs.filter(
+  const limit = Number.parseInt(req.query.limit, 10);
+  let history = db.logs.filter(
     (l) => l.shipmentId === req.params.id && (!from || l.timestamp >= from) && (!to || l.timestamp <= to)
   );
+  if (limit > 0) history = history.slice(-limit); // solo las últimas N lecturas
   res.json(history);
 });
 
@@ -191,7 +193,8 @@ app.get('/alerts', (req, res) => {
         (!severity || a.severity === severity)
     )
     .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-  res.json(list);
+  const limit = Number.parseInt(req.query.limit, 10);
+  res.json(limit > 0 ? list.slice(0, limit) : list);
 });
 
 app.patch('/alerts/:id/resolve', (req, res) => {
