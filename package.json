@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "simulate": "node scripts/simulate-telemetry.js",
     "docker:up": "docker compose up --build",
     "docker:down": "docker compose down"
   },
