@@ -29,6 +29,7 @@ services:
       - "3001:3001"
     environment:
       - PORT=3001
+      - CONTAINER_SERVICE_URL=http://container-service:3003
     networks:
       - cold2hot-network
 
@@ -39,8 +40,6 @@ services:
       - "3002:3002"
     environment:
       - PORT=3002
-      - ORDERS_SERVICE_URL=http://orders-service:3005
-      - SECURITY_SERVICE_URL=http://security-service:3004
     networks:
       - cold2hot-network
 
@@ -74,6 +73,10 @@ services:
       - CONTAINER_SERVICE_URL=http://container-service:3003
       - SECURITY_SERVICE_URL=http://security-service:3004
       - TELEMETRY_SERVICE_URL=http://telemetry-service:3002
+    depends_on:
+      - container-service
+      - security-service
+      - telemetry-service
     networks:
       - cold2hot-network
 

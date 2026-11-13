@@ -13,46 +13,66 @@ const SECURITY_PORT = process.env.INTERNAL_SECURITY_PORT || 3004;
 const ORDERS_PORT = process.env.INTERNAL_ORDERS_PORT || 3005;
 const GATEWAY_PORT = process.env.PORT || 8080;
 
-const urls = {
-  IAM_SERVICE_URL: `http://127.0.0.1:${IAM_PORT}`,
-  TELEMETRY_SERVICE_URL: `http://127.0.0.1:${TELEMETRY_PORT}`,
-  CONTAINER_SERVICE_URL: `http://127.0.0.1:${CONTAINER_PORT}`,
-  SECURITY_SERVICE_URL: `http://127.0.0.1:${SECURITY_PORT}`,
-  ORDERS_SERVICE_URL: `http://127.0.0.1:${ORDERS_PORT}`
-};
-
 console.log('====================================================');
 console.log('   Cold2Hot IoT - Cloud Microservices Orchestrator  ');
 console.log('====================================================');
 
-const services = [
-  ['iam-service', IAM_PORT],
-  ['telemetry-service', TELEMETRY_PORT],
-  ['container-service', CONTAINER_PORT],
-  ['security-service', SECURITY_PORT],
-  ['orders-service', ORDERS_PORT]
-];
+// 1. Iniciar Microservicio IAM (Identidad y Accesos)
+const iamProcess = fork(path.join(__dirname, 'iam-service', 'src', 'index.js'), [], {
+  env: { ...process.env, PORT: IAM_PORT, CONTAINER_SERVICE_URL: `http://127.0.0.1:${CONTAINER_PORT}` }
+});
 
-const children = services.map(([name, port]) =>
-  fork(path.join(__dirname, name, 'src', 'index.js'), [], {
-    env: { ...process.env, ...urls, PORT: port }
-  })
-);
+// 2. Iniciar Microservicio de Telemetría Térmica
+const telemetryProcess = fork(path.join(__dirname, 'telemetry-service', 'src', 'index.js'), [], {
+  env: { ...process.env, PORT: TELEMETRY_PORT }
+});
 
-// API Gateway perimetral tras inicialización de servicios
+// 3. Iniciar Microservicio de Contenedores SmartBox y Dispositivos
+const containerProcess = fork(path.join(__dirname, 'container-service', 'src', 'index.js'), [], {
+  env: { ...process.env, PORT: CONTAINER_PORT }
+});
+
+// 4. Iniciar Microservicio de Acceso y Seguridad
+const securityProcess = fork(path.join(__dirname, 'security-service', 'src', 'index.js'), [], {
+  env: { ...process.env, PORT: SECURITY_PORT }
+});
+
+// 5. Iniciar Microservicio de Envíos y Auditoría
+const ordersProcess = fork(path.join(__dirname, 'orders-service', 'src', 'index.js'), [], {
+  env: {
+    ...process.env,
+    PORT: ORDERS_PORT,
+    CONTAINER_SERVICE_URL: `http://127.0.0.1:${CONTAINER_PORT}`,
+    SECURITY_SERVICE_URL: `http://127.0.0.1:${SECURITY_PORT}`,
+    TELEMETRY_SERVICE_URL: `http://127.0.0.1:${TELEMETRY_PORT}`
+  }
+});
+
+// 6. Iniciar API Gateway perimetral tras inicialización de servicios
 setTimeout(() => {
-  const gateway = fork(path.join(__dirname, 'api-gateway', 'src', 'index.js'), [], {
-    env: { ...process.env, ...urls, PORT: GATEWAY_PORT }
+  const gatewayProcess = fork(path.join(__dirname, 'api-gateway', 'src', 'index.js'), [], {
+    env: {
+      ...process.env,
+      PORT: GATEWAY_PORT,
+      IAM_SERVICE_URL: `http://127.0.0.1:${IAM_PORT}`,
+      TELEMETRY_SERVICE_URL: `http://127.0.0.1:${TELEMETRY_PORT}`,
+      CONTAINER_SERVICE_URL: `http://127.0.0.1:${CONTAINER_PORT}`,
+      SECURITY_SERVICE_URL: `http://127.0.0.1:${SECURITY_PORT}`,
+      ORDERS_SERVICE_URL: `http://127.0.0.1:${ORDERS_PORT}`
+    }
   });
-  children.push(gateway);
-}, 800);
 
-const cleanup = () => {
-  console.log('[ORCHESTRATOR] Deteniendo microservicios...');
-  children.forEach((c) => {
-    try { c.kill(); } catch (e) {}
-  });
-  process.exit(0);
-};
-process.on('SIGINT', cleanup);
-process.on('SIGTERM', cleanup);
+  const cleanup = () => {
+    console.log('[ORCHESTRATOR] Deteniendo microservicios...');
+    try { iamProcess.kill(); } catch (e) {}
+    try { telemetryProcess.kill(); } catch (e) {}
+    try { containerProcess.kill(); } catch (e) {}
+    try { securityProcess.kill(); } catch (e) {}
+    try { ordersProcess.kill(); } catch (e) {}
+    try { gatewayProcess.kill(); } catch (e) {}
+    process.exit(0);
+  };
+
+  process.on('SIGINT', cleanup);
+  process.on('SIGTERM', cleanup);
+}, 800);
