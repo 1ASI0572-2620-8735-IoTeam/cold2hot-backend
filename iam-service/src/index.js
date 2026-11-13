@@ -1,7 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
 const swaggerUi = require('swagger-ui-express');
 
@@ -13,6 +11,9 @@ app.use(express.json());
 
 const CONTAINER_URL = process.env.CONTAINER_SERVICE_URL || 'http://localhost:3003';
 const JWT_SECRET = process.env.JWT_SECRET || 'cold2hot-dev-secret-change-me';
+if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
+  console.warn('[IAM-SERVICE] JWT_SECRET no definida: se usa la clave de desarrollo y cualquiera podría firmar tokens. Configúrala en el entorno.');
+}
 const TOKEN_TTL_HOURS = 8;
 const RESET_TTL_MIN = 30;
 
@@ -65,8 +66,6 @@ const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const now = () => new Date().toISOString();
 const newId = (prefix) => `${prefix}-${crypto.randomInt(100000, 999999)}`;
 
-const DATA_FILE = process.env.IAM_DATA_FILE || path.join(__dirname, '..', 'data', 'db.json');
-
 const seed = () => ({
   restaurants: [
     {
@@ -95,33 +94,35 @@ const seed = () => ({
   resetTokens: []
 });
 
-const load = () => {
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {
-    return seed();
+// Con DATABASE_URL se usan las tablas relacionales; sin ella, el JSON local (desarrollo).
+const { pool } = require('./store');
+const repo = pool ? require('./pgrepo') : require('./memrepo');
+
+const ready = repo.init(seed()).then(
+  (msg) => console.log(`[IAM-SERVICE] ${pool ? 'PostgreSQL' : 'Persistencia local'}: ${msg}`),
+  (e) => {
+    console.error('[IAM-SERVICE] No se pudo inicializar la base de datos:', e.message);
+    throw e;
   }
-};
+);
+ready.catch(() => {});
 
-let db = load();
-const remote = require('./store').attach('iam', () => db, (d) => { db = d; });
-
-const save = () => {
-  remote.push();
+// Express 4 no captura rechazos de handlers async
+const h = (fn) => async (req, res, next) => {
   try {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+    await ready;
+    await fn(req, res, next);
   } catch (e) {
-    console.warn('[IAM-SERVICE] No se pudo persistir en disco:', e.message);
+    console.error('[IAM-SERVICE]', e.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Error interno de IAM' });
   }
 };
 
-const findRestaurant = (id) => db.restaurants.find((r) => r.restaurantId === id);
-const emailTaken = (email) =>
-  db.users.some((u) => u.email === email) || db.operators.some((o) => o.email === email);
+const subscriptionView = (restaurant) =>
+  restaurant ? { ...restaurant.subscription, details: PLANS[restaurant.subscription.plan] } : null;
 
-const sessionPayload = (user) => {
-  const restaurant = findRestaurant(user.restaurantId);
+const sessionPayload = async (user) => {
+  const restaurant = await repo.restaurant(user.restaurantId);
   return {
     token: createToken(user),
     expiresIn: TOKEN_TTL_HOURS * 3600,
@@ -137,19 +138,16 @@ const sessionPayload = (user) => {
   };
 };
 
-const subscriptionView = (restaurant) =>
-  restaurant ? { ...restaurant.subscription, details: PLANS[restaurant.subscription.plan] } : null;
-
-const auth = (req, res, next) => {
+const auth = h(async (req, res, next) => {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   const data = verifyToken(token);
   if (!data) return res.status(401).json({ error: 'Token inválido o expirado' });
-  const user = db.users.find((u) => u.userId === data.sub);
+  const user = await repo.userById(data.sub);
   if (!user) return res.status(401).json({ error: 'Usuario no existe' });
   req.user = user;
-  req.restaurant = findRestaurant(user.restaurantId);
+  req.restaurant = await repo.restaurant(user.restaurantId);
   next();
-};
+});
 
 // Llamada HTTP a otro microservicio (no rompe si está caído)
 const call = async (url) => {
@@ -325,7 +323,7 @@ const swaggerDocument = {
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 // Auth
-app.post('/auth/register', (req, res) => {
+app.post('/auth/register', h(async (req, res) => {
   const { admin = {}, restaurant = {} } = req.body || {};
   const errors = {};
   if (!admin.name) errors['admin.name'] = 'Nombre requerido';
@@ -336,7 +334,7 @@ app.post('/auth/register', (req, res) => {
   if (Object.keys(errors).length) return res.status(400).json({ error: 'Datos inválidos', details: errors });
 
   const email = admin.email.toLowerCase().trim();
-  if (emailTaken(email)) return res.status(409).json({ error: 'El email ya está registrado' });
+  if (await repo.emailTaken(email)) return res.status(409).json({ error: 'El email ya está registrado' });
 
   const rest = {
     restaurantId: newId('REST'),
@@ -353,52 +351,49 @@ app.post('/auth/register', (req, res) => {
   };
   const user = { userId: newId('USR'), email, passwordHash: hashPassword(admin.password), name: admin.name, role: 'ADMINISTRATOR', restaurantId: rest.restaurantId, createdAt: now() };
 
-  db.restaurants.push(rest);
-  db.users.push(user);
-  save();
+  try {
+    await repo.register(rest, user);
+  } catch (e) {
+    if (e.code === 'EMAIL_TAKEN') return res.status(409).json({ error: 'El email ya está registrado' });
+    throw e;
+  }
   res.status(201).json({
     message: 'Restaurante registrado satisfactoriamente',
-    ...sessionPayload(user),
+    ...(await sessionPayload(user)),
     onboarding: { registerSmartBox: false, inviteOperator: false, choosePlan: false }
   });
-});
+}));
 
-app.post('/auth/login', (req, res) => {
+app.post('/auth/login', h(async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email y contraseña requeridos' });
-  const user = db.users.find((u) => u.email === String(email).toLowerCase().trim());
-  if (!user || !verifyPassword(password, user.passwordHash)) {
+  const user = await repo.userByEmail(String(email).toLowerCase().trim());
+  if (!user || !verifyPassword(String(password), user.passwordHash)) {
     return res.status(401).json({ error: 'Credenciales inválidas' });
   }
-  res.json({ message: 'Inicio de sesión exitoso', ...sessionPayload(user) });
-});
+  res.json({ message: 'Inicio de sesión exitoso', ...(await sessionPayload(user)) });
+}));
 
-app.post('/auth/forgot-password', (req, res) => {
+app.post('/auth/forgot-password', h(async (req, res) => {
   const email = String(req.body?.email || '').toLowerCase().trim();
   const response = { message: 'Si el email está registrado, recibirás un enlace para restablecer tu contraseña' };
-  const user = db.users.find((u) => u.email === email);
+  const user = await repo.userByEmail(email);
   if (user) {
     const token = crypto.randomBytes(24).toString('hex');
-    db.resetTokens = db.resetTokens.filter((t) => t.userId !== user.userId);
-    db.resetTokens.push({ token, userId: user.userId, expiresAt: new Date(Date.now() + RESET_TTL_MIN * 60000).toISOString() });
-    save();
+    await repo.setResetToken(user.userId, token, new Date(Date.now() + RESET_TTL_MIN * 60000).toISOString());
     // Sin servicio de correo: en desarrollo devolvemos el token para poder probar
     if (process.env.NODE_ENV !== 'production') response.devResetToken = token;
   }
   res.json(response);
-});
+}));
 
-app.post('/auth/reset-password', (req, res) => {
+app.post('/auth/reset-password', h(async (req, res) => {
   const { token, newPassword } = req.body || {};
-  const entry = db.resetTokens.find((t) => t.token === token);
-  if (!entry || new Date(entry.expiresAt) < new Date()) return res.status(400).json({ error: 'Token inválido o expirado' });
+  if (!token) return res.status(400).json({ error: 'Token inválido o expirado' });
   if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'La contraseña debe tener mínimo 8 caracteres' });
-  const user = db.users.find((u) => u.userId === entry.userId);
-  user.passwordHash = hashPassword(newPassword);
-  db.resetTokens = db.resetTokens.filter((t) => t !== entry);
-  save();
+  if (!(await repo.resetPassword(token, hashPassword(newPassword)))) return res.status(400).json({ error: 'Token inválido o expirado' });
   res.json({ message: 'Contraseña actualizada. Ya puedes iniciar sesión' });
-});
+}));
 
 // Perfil
 const profileView = (user, restaurant) => ({
@@ -411,13 +406,14 @@ app.get('/users/me', auth, (req, res) => {
   res.json(profileView(req.user, req.restaurant));
 });
 
-app.put('/users/me', auth, (req, res) => {
+app.put('/users/me', auth, h(async (req, res) => {
   const { name, restaurant, settings } = req.body || {};
   if (name !== undefined) {
     if (!String(name).trim()) return res.status(400).json({ error: 'El nombre no puede estar vacío' });
     req.user.name = String(name).trim();
   }
   if (restaurant) {
+    if (restaurant.name !== undefined && !String(restaurant.name).trim()) return res.status(400).json({ error: 'El nombre del restaurante no puede estar vacío' });
     ['name', 'phone', 'address'].forEach((k) => {
       if (restaurant[k] !== undefined) req.restaurant[k] = restaurant[k];
     });
@@ -428,24 +424,26 @@ app.put('/users/me', auth, (req, res) => {
       const t = settings.defaultThresholds?.[type];
       if (!t) continue;
       const merged = { ...s.defaultThresholds[type], ...t };
-      if (Number(merged.minTemperature) >= Number(merged.maxTemperature)) {
+      merged.minTemperature = Number(merged.minTemperature);
+      merged.maxTemperature = Number(merged.maxTemperature);
+      if (!Number.isFinite(merged.minTemperature) || !Number.isFinite(merged.maxTemperature) || merged.minTemperature >= merged.maxTemperature) {
         return res.status(400).json({ error: `Umbral ${type}: minTemperature debe ser menor que maxTemperature` });
       }
       s.defaultThresholds[type] = merged;
     }
     if (settings.notifications) s.notifications = { ...s.notifications, ...settings.notifications };
   }
-  save();
+  if (name !== undefined) await repo.saveUser(req.user);
+  if (restaurant || settings) await repo.saveRestaurant(req.restaurant);
   res.json(profileView(req.user, req.restaurant));
-});
+}));
 
 // Operadores
-app.get('/operators', auth, (req, res) => {
-  const { status } = req.query;
-  res.json(db.operators.filter((o) => o.restaurantId === req.restaurant.restaurantId && (!status || o.status === status)));
-});
+app.get('/operators', auth, h(async (req, res) => {
+  res.json(await repo.operators(req.restaurant.restaurantId, req.query.status));
+}));
 
-app.post('/operators', auth, (req, res) => {
+app.post('/operators', auth, h(async (req, res) => {
   const { name, email, phone } = req.body || {};
   const errors = {};
   if (!name) errors.name = 'Nombre requerido';
@@ -453,30 +451,30 @@ app.post('/operators', auth, (req, res) => {
   if (Object.keys(errors).length) return res.status(400).json({ error: 'Datos inválidos', details: errors });
 
   const mail = email.toLowerCase().trim();
-  if (emailTaken(mail)) return res.status(409).json({ error: 'Ya existe un usuario u operador con ese email' });
+  if (await repo.emailTaken(mail)) return res.status(409).json({ error: 'Ya existe un usuario u operador con ese email' });
 
   const plan = PLANS[req.restaurant.subscription.plan];
-  const current = db.operators.filter((o) => o.restaurantId === req.restaurant.restaurantId && o.status !== 'INACTIVE').length;
+  const current = await repo.countOperators(req.restaurant.restaurantId);
   if (plan.maxOperators !== null && current >= plan.maxOperators) {
     return res.status(409).json({ error: `Tu plan ${plan.name} permite hasta ${plan.maxOperators} operadores. Mejora tu plan para invitar más.` });
   }
 
-  const operator = { operatorId: newId('OP'), restaurantId: req.restaurant.restaurantId, name, email: mail, phone: phone || null, status: 'INVITED', completedDeliveries: 0, custodyRating: null, invitedAt: now() };
-  db.operators.push(operator);
-  save();
-  res.status(201).json({ ...operator, message: `Invitación enviada a ${mail}` });
-});
+  try {
+    const operator = await repo.createOperator({ operatorId: newId('OP'), restaurantId: req.restaurant.restaurantId, name, email: mail, phone: phone || null, status: 'INVITED', completedDeliveries: 0, custodyRating: null, invitedAt: now() });
+    res.status(201).json({ ...operator, message: `Invitación enviada a ${mail}` });
+  } catch (e) {
+    if (e.code === 'EMAIL_TAKEN') return res.status(409).json({ error: 'Ya existe un usuario u operador con ese email' });
+    throw e;
+  }
+}));
 
-app.patch('/operators/:operatorId/status', auth, (req, res) => {
-  const op = db.operators.find((o) => o.operatorId === req.params.operatorId && o.restaurantId === req.restaurant.restaurantId);
-  if (!op) return res.status(404).json({ error: 'Operador no encontrado' });
+app.patch('/operators/:operatorId/status', auth, h(async (req, res) => {
   const { status } = req.body || {};
   if (!['ACTIVE', 'INACTIVE'].includes(status)) return res.status(400).json({ error: 'status debe ser ACTIVE o INACTIVE' });
-  op.status = status;
-  op.updatedAt = now();
-  save();
+  const op = await repo.setOperatorStatus(req.restaurant.restaurantId, req.params.operatorId, status);
+  if (!op) return res.status(404).json({ error: 'Operador no encontrado' });
   res.json(op);
-});
+}));
 
 // Suscripciones
 app.get('/subscriptions/plans', (req, res) => {
@@ -485,16 +483,15 @@ app.get('/subscriptions/plans', (req, res) => {
 
 const fleetSize = async () => {
   const r = await call(`${CONTAINER_URL}/smartboxes`);
-  return r.ok ? r.data.filter((b) => b.status !== 'DECOMMISSIONED').length : null;
+  return r.ok && Array.isArray(r.data) ? r.data.filter((b) => b.status !== 'DECOMMISSIONED').length : null;
 };
 
-app.get('/subscriptions/current', auth, async (req, res) => {
-  const boxes = await fleetSize();
-  const operators = db.operators.filter((o) => o.restaurantId === req.restaurant.restaurantId && o.status !== 'INACTIVE').length;
+app.get('/subscriptions/current', auth, h(async (req, res) => {
+  const [boxes, operators] = await Promise.all([fleetSize(), repo.countOperators(req.restaurant.restaurantId)]);
   res.json({ ...subscriptionView(req.restaurant), usage: { boxes, operators } });
-});
+}));
 
-app.post('/subscriptions/upgrade', auth, async (req, res) => {
+app.post('/subscriptions/upgrade', auth, h(async (req, res) => {
   const { plan, paymentMethod } = req.body || {};
   const target = PLANS[plan];
   if (!target) return res.status(400).json({ error: 'Plan inválido. Usa STARTER, PRO o ENTERPRISE' });
@@ -514,9 +511,9 @@ app.post('/subscriptions/upgrade', auth, async (req, res) => {
   if (paymentMethod) sub.paymentMethod = { brand: paymentMethod.brand || 'CARD', last4: String(paymentMethod.last4) };
   sub.startedAt = now();
   sub.renewsAt = new Date(Date.now() + 30 * 86400000).toISOString();
-  save();
+  await repo.saveRestaurant(req.restaurant);
   res.json({ message: `Plan actualizado a ${target.name}`, ...subscriptionView(req.restaurant), usage: { boxes } });
-});
+}));
 
 app.get('/health', (req, res) => {
   res.json({ service: 'iam-service', status: 'UP', timestamp: now() });

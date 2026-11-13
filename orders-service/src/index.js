@@ -1,7 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
 const swaggerUi = require('swagger-ui-express');
 
@@ -9,19 +7,19 @@ const app = express();
 const PORT = process.env.PORT || 3005;
 
 app.use(cors());
-app.use(express.json({ limit: '5mb' })); // fotos en Base64
+app.use(express.json({ limit: '8mb' })); // fotos en Base64 (hasta 5 MB de imagen)
 
 // URLs de otros microservicios (inyectadas por el orquestador / docker-compose)
 const CONTAINER_URL = process.env.CONTAINER_SERVICE_URL || 'http://localhost:3003';
 const SECURITY_URL = process.env.SECURITY_SERVICE_URL || 'http://localhost:3004';
 const TELEMETRY_URL = process.env.TELEMETRY_SERVICE_URL || 'http://localhost:3002';
 
-const DATA_FILE = process.env.ORDERS_DATA_FILE || path.join(__dirname, '..', 'data', 'db.json');
 const ACTIVE_STATUSES = ['CREATED', 'IN_TRANSIT'];
 const THERMAL_DEFAULTS = { COLD: { minTemperature: 0, maxTemperature: 8 }, HOT: { minTemperature: 55, maxTemperature: 75 } };
 
 const now = () => new Date().toISOString();
 const daysAgo = (d) => new Date(Date.now() - d * 86400000).toISOString();
+const normId = (id) => String(id || '').replace(/^#/, '');
 
 const seed = () => ({
   orders: [
@@ -34,31 +32,30 @@ const seed = () => ({
   audits: {}
 });
 
-const load = () => {
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {
-    return seed();
+// Con DATABASE_URL se usan las tablas relacionales; sin ella, el JSON local (desarrollo).
+const { pool } = require('./store');
+const repo = pool ? require('./pgrepo') : require('./memrepo');
+const storage = require('./storage');
+
+// Las peticiones esperan a que las tablas estén listas
+const ready = repo.init(seed()).then(
+  (msg) => console.log(`[ORDERS-SERVICE] ${pool ? 'PostgreSQL' : 'Persistencia local'}: ${msg}`),
+  (e) => {
+    console.error('[ORDERS-SERVICE] No se pudo inicializar la base de datos:', e.message);
+    throw e;
   }
-};
+);
+ready.catch(() => {});
 
-let db = load();
-const remote = require('./store').attach('orders', () => db, (d) => { db = d; });
-
-const save = () => {
-  remote.push();
+// Express 4 no captura rechazos de handlers async
+const h = (fn) => async (req, res) => {
   try {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+    await ready;
+    await fn(req, res);
   } catch (e) {
-    console.warn('[ORDERS-SERVICE] No se pudo persistir en disco:', e.message);
+    console.error('[ORDERS-SERVICE]', e.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Error interno de envíos' });
   }
-};
-
-const findOrder = (orderId) => db.orders.find((o) => o.orderId === orderId.replace(/^#/, ''));
-const nextOrderId = () => {
-  const max = db.orders.reduce((m, o) => Math.max(m, parseInt(o.orderId.replace('C2H-', ''), 10) || 0), 10000);
-  return 'C2H-' + (max + 1);
 };
 
 // Llamada HTTP a otro microservicio. Si está caído devuelve { ok:false } en vez de romper.
@@ -154,7 +151,7 @@ const swaggerDocument = {
           type: 'object',
           properties: {
             photoUrl: { type: 'string', example: 'https://picsum.photos/seed/entrega/600/400' },
-            photoBase64: { type: 'string', description: 'Alternativa a photoUrl (data:image/jpeg;base64,...)' }
+            photoBase64: { type: 'string', description: 'Alternativa a photoUrl (data:image/jpeg;base64,...). Se sube a Supabase Storage y la respuesta devuelve su photoUrl. JPEG, PNG o WebP, máx. 5 MB' }
           }
         }),
         responses: { 200: { description: 'Entrega completada' }, 400: { description: 'Falta la foto' }, 409: { description: 'El envío no está en curso' } }
@@ -166,14 +163,27 @@ const swaggerDocument = {
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 // Helpers de custodia
+const list = (r) => (r.ok && Array.isArray(r.data) ? r.data : []);
+
 // Alertas de security (aperturas) + telemetry (desvío térmico) de un envío
 const securityAlertsFor = async (orderId) => {
-  const [r, r2, t] = await Promise.all([
+  const [s, t] = await Promise.all([
     call(`${SECURITY_URL}/alerts?orderId=${encodeURIComponent(orderId)}`),
-    call(`${SECURITY_URL}/alerts?orderId=${encodeURIComponent('#' + orderId)}`),
     call(`${TELEMETRY_URL}/alerts?orderId=${encodeURIComponent(orderId)}`)
   ]);
-  return [...(r.ok ? r.data : []), ...(r2.ok ? r2.data : []), ...(t.ok ? t.data : [])];
+  return [...list(s), ...list(t)];
+};
+
+// Todas las alertas agrupadas por envío: 2 llamadas en total en vez de 2 por envío
+const alertsByOrder = async () => {
+  const [s, t] = await Promise.all([call(`${SECURITY_URL}/alerts`), call(`${TELEMETRY_URL}/alerts?limit=10000`)]);
+  const map = new Map();
+  for (const a of [...list(s), ...list(t)]) {
+    const id = normId(a.orderId);
+    if (!map.has(id)) map.set(id, []);
+    map.get(id).push(a);
+  }
+  return map;
 };
 
 const custodyStatus = (order, alerts = []) => {
@@ -182,37 +192,29 @@ const custodyStatus = (order, alerts = []) => {
   return 'VERIFIED';
 };
 
+const validDate = (d) => !d || (/^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(Date.parse(d)));
+
 // Endpoints (las rutas fijas van ANTES de /:orderId)
-app.get('/', async (req, res) => {
-  const { q, status, custody, operator, smartBoxId, profile, from, to } = req.query;
-  let list = db.orders.filter((o) => {
-    if (q && !`${o.orderId} ${o.customerName} ${o.deliveryAddress}`.toLowerCase().includes(q.replace(/^#/, '').toLowerCase())) return false;
-    if (status && o.status !== status) return false;
-    if (operator && o.operatorId !== operator && o.operatorName.toLowerCase() !== operator.toLowerCase()) return false;
-    if (smartBoxId && o.smartBoxId !== smartBoxId) return false;
-    if (profile && o.thermalProfile.type !== profile) return false;
-    if (from && o.createdAt < from) return false;
-    if (to && o.createdAt.slice(0, 10) > to) return false;
-    return true;
-  });
-
+app.get('/', h(async (req, res) => {
+  const { custody, from, to } = req.query;
+  if (!validDate(from) || !validDate(to)) return res.status(400).json({ error: 'from y to deben tener formato YYYY-MM-DD' });
+  let orders = await repo.list(req.query);
   if (custody) {
-    const withAlerts = await Promise.all(list.map(async (o) => ({ o, c: custodyStatus(o, await securityAlertsFor(o.orderId)) })));
-    list = withAlerts.filter((x) => x.c === custody).map((x) => x.o);
+    const alerts = await alertsByOrder();
+    orders = orders.filter((o) => custodyStatus(o, alerts.get(o.orderId)) === custody);
   }
-
-  res.json(list.sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
-});
+  res.json(orders);
+}));
 
 app.get('/health', (req, res) => {
-  res.json({ service: 'orders-service', status: 'UP', timestamp: now() });
+  res.json({ service: 'orders-service', status: 'UP', storage: storage.enabled ? 'supabase' : 'inline', timestamp: now() });
 });
 
-app.get('/active', (req, res) => {
-  res.json(db.orders.filter((o) => ACTIVE_STATUSES.includes(o.status)));
-});
+app.get('/active', h(async (req, res) => {
+  res.json(await repo.active());
+}));
 
-app.post('/', async (req, res) => {
+app.post('/', h(async (req, res) => {
   const { customerName, deliveryAddress, smartBoxId, operatorId, operatorName, thermalProfile } = req.body || {};
   const errors = {};
   if (!customerName) errors.customerName = 'Cliente requerido';
@@ -223,10 +225,12 @@ app.post('/', async (req, res) => {
   if (!THERMAL_DEFAULTS[type]) errors.thermalProfile = 'type debe ser COLD o HOT';
   if (Object.keys(errors).length) return res.status(400).json({ error: 'Datos inválidos', details: errors });
 
-  const profile = { type, ...THERMAL_DEFAULTS[type], ...thermalProfile };
-  if (profile.minTemperature >= profile.maxTemperature) {
+  const minTemperature = Number(thermalProfile.minTemperature ?? THERMAL_DEFAULTS[type].minTemperature);
+  const maxTemperature = Number(thermalProfile.maxTemperature ?? THERMAL_DEFAULTS[type].maxTemperature);
+  if (!Number.isFinite(minTemperature) || !Number.isFinite(maxTemperature) || minTemperature >= maxTemperature) {
     return res.status(400).json({ error: 'minTemperature debe ser menor que maxTemperature' });
   }
+  const profile = { type, minTemperature, maxTemperature };
 
   // 1. Validar la SmartBox con container-service (si está disponible)
   const box = await call(`${CONTAINER_URL}/smartboxes/${encodeURIComponent(smartBoxId)}`);
@@ -235,49 +239,40 @@ app.post('/', async (req, res) => {
     if (box.data.status !== 'AVAILABLE') return res.status(409).json({ error: `SmartBox no disponible (estado ${box.data.status})` });
     if (box.data.batteryLevel < 15) return res.status(409).json({ error: 'SmartBox con batería menor a 15%' });
   }
-  if (db.orders.some((o) => o.smartBoxId === smartBoxId && ACTIVE_STATUSES.includes(o.status))) {
-    return res.status(409).json({ error: 'La SmartBox ya tiene un envío en curso' });
+
+  // 2. Guardar el envío (la base garantiza un solo envío en curso por caja)
+  let order;
+  try {
+    order = await repo.create({ customerName, deliveryAddress, smartBoxId, operatorId, operatorName: operatorName || operatorId, thermalProfile: profile, status: 'IN_TRANSIT' });
+  } catch (e) {
+    if (e.code === 'BOX_BUSY') return res.status(409).json({ error: 'La SmartBox ya tiene un envío en curso' });
+    throw e;
   }
 
-  const order = {
-    orderId: nextOrderId(),
-    customerName,
-    deliveryAddress,
-    smartBoxId,
-    operatorId,
-    operatorName: operatorName || operatorId,
-    thermalProfile: profile,
-    status: 'IN_TRANSIT',
-    incidents: [],
-    evidence: null,
-    createdAt: now(),
-    deliveredAt: null
-  };
+  // 3. Marcar la caja en tránsito, registrar perfil térmico y emitir OTP
+  const [, tp, otp] = await Promise.all([
+    call(`${CONTAINER_URL}/smartboxes/${encodeURIComponent(smartBoxId)}/status`, { method: 'PATCH', body: { status: 'IN_TRANSIT' } }),
+    call(`${TELEMETRY_URL}/thermal-profiles`, { method: 'POST', body: { orderId: order.orderId, smartBoxId, ...profile } }),
+    call(`${SECURITY_URL}/otp`, { method: 'POST', body: { orderId: order.orderId, smartBoxId } })
+  ]);
 
-  // 2. Marcar la caja en tránsito, registrar perfil térmico y emitir OTP
-  await call(`${CONTAINER_URL}/smartboxes/${encodeURIComponent(smartBoxId)}/status`, { method: 'PATCH', body: { status: 'IN_TRANSIT' } });
-  const tp = await call(`${TELEMETRY_URL}/thermal-profiles`, { method: 'POST', body: { orderId: order.orderId, smartBoxId, ...profile } });
-  const otp = await call(`${SECURITY_URL}/otp`, { method: 'POST', body: { orderId: order.orderId, smartBoxId } });
-
-  db.orders.push(order);
-  save();
   res.status(201).json({
     ...order,
     otp: otp.ok ? { code: otp.data.code, expiresAt: otp.data.expiresAt } : null,
     warnings: [!box.ok && 'container-service no disponible: caja no validada', !otp.ok && 'security-service no disponible: OTP no emitido', !tp.ok && 'telemetry-service no disponible: perfil térmico no registrado'].filter(Boolean)
   });
-});
+}));
 
-app.get('/analytics/operators', async (req, res) => {
+app.get('/analytics/operators', h(async (req, res) => {
   const month = req.query.month || now().slice(0, 7);
-  const orders = db.orders.filter((o) => o.status === 'DELIVERED' && (o.deliveredAt || o.createdAt).startsWith(month));
+  if (!/^\d{4}-\d{2}$/.test(month)) return res.status(400).json({ error: 'month debe tener formato YYYY-MM' });
+  const [orders, alerts] = await Promise.all([repo.deliveredInMonth(month), alertsByOrder()]);
 
   const stats = {};
   for (const o of orders) {
     const s = (stats[o.operatorId] ||= { operatorId: o.operatorId, operatorName: o.operatorName, totalDeliveries: 0, perfectDeliveries: 0, incidentDeliveries: 0 });
     s.totalDeliveries++;
-    const alerts = await securityAlertsFor(o.orderId);
-    if (custodyStatus(o, alerts) === 'VERIFIED') s.perfectDeliveries++;
+    if (custodyStatus(o, alerts.get(o.orderId)) === 'VERIFIED') s.perfectDeliveries++;
     else s.incidentDeliveries++;
   }
 
@@ -289,7 +284,7 @@ app.get('/analytics/operators', async (req, res) => {
     fleet: { totalDeliveries: total, perfectDeliveries: perfect, compliancePercent: total ? Math.round((perfect / total) * 100) : 0 },
     operators: operators.sort((a, b) => b.compliancePercent - a.compliancePercent)
   });
-});
+}));
 
 // Arma el reporte juntando datos de telemetry y security
 const buildAuditReport = async (order) => {
@@ -300,7 +295,7 @@ const buildAuditReport = async (order) => {
     securityAlertsFor(order.orderId)
   ]);
   const logs = telemetry.ok ? telemetry.data.logs || [] : [];
-  const thermalHistory = logs.filter((l) => l.shipmentId === order.orderId || l.shipmentId === '#' + order.orderId).reverse();
+  const thermalHistory = logs.filter((l) => normId(l.shipmentId) === order.orderId).reverse();
 
   return {
     orderId: order.orderId,
@@ -308,8 +303,8 @@ const buildAuditReport = async (order) => {
     operator: { operatorId: order.operatorId, operatorName: order.operatorName },
     thermalProfile: order.thermalProfile,
     thermalHistory,
-    accessAttempts: attempts.ok ? attempts.data : [],
-    openingEvents: events.ok ? events.data : [],
+    accessAttempts: list(attempts),
+    openingEvents: list(events),
     securityAlerts: alerts,
     evidence: order.evidence || { status: 'PENDING_SYNC', message: 'Evidencia pendiente de sincronización' },
     custodyStatus: custodyStatus(order, alerts),
@@ -317,18 +312,20 @@ const buildAuditReport = async (order) => {
   };
 };
 
-app.get('/audits/:orderId', async (req, res) => {
-  const order = findOrder(req.params.orderId);
-  if (!order) return res.status(404).json({ error: 'Envío no encontrado' });
-  const stored = db.audits[order.orderId];
+app.get('/audits/:orderId', h(async (req, res) => {
+  const id = normId(req.params.orderId);
+  const stored = await repo.audit(id);
   if (stored) return res.json(stored);
-  res.json({ consolidated: false, ...(await buildAuditReport(order)) });
-});
-
-app.post('/audits/:orderId', async (req, res) => {
-  const order = findOrder(req.params.orderId);
+  const order = await repo.find(id, { withPhoto: true });
   if (!order) return res.status(404).json({ error: 'Envío no encontrado' });
-  if (db.audits[order.orderId]) return res.status(409).json({ error: 'El reporte ya fue consolidado y es inmutable', report: db.audits[order.orderId] });
+  res.json({ consolidated: false, ...(await buildAuditReport(order)) });
+}));
+
+app.post('/audits/:orderId', h(async (req, res) => {
+  const order = await repo.find(normId(req.params.orderId), { withPhoto: true });
+  if (!order) return res.status(404).json({ error: 'Envío no encontrado' });
+  const existing = await repo.audit(order.orderId);
+  if (existing) return res.status(409).json({ error: 'El reporte ya fue consolidado y es inmutable', report: existing });
 
   const body = await buildAuditReport(order);
   const report = {
@@ -338,33 +335,70 @@ app.post('/audits/:orderId', async (req, res) => {
     ...body
   };
   report.integrityHash = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
-  db.audits[order.orderId] = report;
-  save();
-  res.status(201).json(report);
-});
+  const saved = await repo.saveAudit(report);
+  if (!saved) return res.status(409).json({ error: 'El reporte ya fue consolidado y es inmutable', report: await repo.audit(order.orderId) });
+  res.status(201).json(saved);
+}));
 
-app.get('/:orderId', (req, res) => {
-  const order = findOrder(req.params.orderId);
+app.get('/:orderId', h(async (req, res) => {
+  const order = await repo.find(normId(req.params.orderId), { withPhoto: true });
   if (!order) return res.status(404).json({ error: 'Envío no encontrado' });
   res.json(order);
-});
+}));
 
-app.post('/:orderId/evidence', async (req, res) => {
-  const order = findOrder(req.params.orderId);
+app.post('/:orderId/evidence', h(async (req, res) => {
+  const order = await repo.find(normId(req.params.orderId));
   if (!order) return res.status(404).json({ error: 'Envío no encontrado' });
   const { photoUrl, photoBase64 } = req.body || {};
   if (!photoUrl && !photoBase64) return res.status(400).json({ error: 'photoUrl o photoBase64 requerido' });
+  if (photoUrl && !/^https?:\/\//i.test(photoUrl)) return res.status(400).json({ error: 'photoUrl debe ser una URL http(s)' });
   if (!ACTIVE_STATUSES.includes(order.status)) return res.status(409).json({ error: `El envío no está en curso (estado ${order.status})` });
 
-  order.evidence = { photoUrl: photoUrl || null, photoBase64: photoBase64 || null, uploadedAt: now() };
-  order.status = 'DELIVERED';
-  order.deliveredAt = now();
+  // La foto en Base64 se sube a Supabase Storage; en la base solo queda su URL
+  let evidence = { photoUrl };
+  if (photoBase64) {
+    const image = storage.parseImage(photoBase64);
+    if (image.error) return res.status(400).json({ error: image.error });
+    if (storage.enabled) {
+      try {
+        evidence = await storage.uploadEvidence(order.orderId, image);
+      } catch (e) {
+        console.error('[ORDERS-SERVICE] Falló la subida a Storage:', e.message);
+        return res.status(502).json({ error: 'No se pudo guardar la foto de evidencia. Intenta nuevamente.' });
+      }
+    } else {
+      evidence = { photoBase64: `data:${image.contentType};base64,${image.buffer.toString('base64')}`, contentType: image.contentType, sizeBytes: image.buffer.length };
+    }
+  }
+
+  const delivered = await repo.deliver(order.orderId, evidence);
+  if (!delivered) {
+    await storage.removeEvidence(evidence.storagePath);
+    return res.status(409).json({ error: 'El envío ya no está en curso' });
+  }
 
   // Liberar la SmartBox
   const freed = await call(`${CONTAINER_URL}/smartboxes/${encodeURIComponent(order.smartBoxId)}/status`, { method: 'PATCH', body: { status: 'AVAILABLE' } });
-  save();
-  res.json({ ...order, smartBoxReleased: freed.ok });
-});
+  res.json({ ...delivered, smartBoxReleased: freed.ok });
+}));
+
+// Fotos que quedaron en Base64 (Storage sin configurar en su momento) se suben al arrancar
+if (storage.enabled) {
+  ready
+    .then(async () => {
+      await storage.ensureBucket();
+      const pending = await repo.pendingPhotos();
+      for (const p of pending) {
+        const image = storage.parseImage(p.photoBase64);
+        if (image.error) continue;
+        await repo.movePhotoToStorage(p.orderId, await storage.uploadEvidence(p.orderId, image));
+      }
+      console.log(`[ORDERS-SERVICE] Supabase Storage listo (bucket ${storage.BUCKET}${pending.length ? `, ${pending.length} foto(s) migradas` : ''})`);
+    })
+    .catch((e) => console.warn('[ORDERS-SERVICE] Supabase Storage no disponible:', e.message));
+} else if (pool) {
+  console.warn('[ORDERS-SERVICE] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY no definidas: las fotos se guardan en la base (Base64)');
+}
 
 app.listen(PORT, () => {
   console.log(`[ORDERS-SERVICE] Escuchando en el puerto ${PORT}. Swagger disponible en http://localhost:${PORT}/docs`);

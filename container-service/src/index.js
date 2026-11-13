@@ -1,7 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
 const swaggerUi = require('swagger-ui-express');
 
 const app = express();
@@ -9,8 +7,6 @@ const PORT = process.env.PORT || 3003;
 
 app.use(cors());
 app.use(express.json());
-
-const DATA_FILE = process.env.CONTAINER_DATA_FILE || path.join(__dirname, '..', 'data', 'db.json');
 
 const STATUSES = ['AVAILABLE', 'IN_TRANSIT', 'MAINTENANCE', 'DECOMMISSIONED'];
 const MAC_REGEX = /^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$/;
@@ -26,31 +22,28 @@ const seed = () => ({
   alerts: []
 });
 
-const load = () => {
-  try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {
-    return seed();
+// Con DATABASE_URL se usan las tablas relacionales; sin ella, el JSON local (desarrollo).
+const { pool } = require('./store');
+const repo = pool ? require('./pgrepo') : require('./memrepo');
+
+const ready = repo.init(seed()).then(
+  (msg) => console.log(`[CONTAINER-SERVICE] ${pool ? 'PostgreSQL' : 'Persistencia local'}: ${msg}`),
+  (e) => {
+    console.error('[CONTAINER-SERVICE] No se pudo inicializar la base de datos:', e.message);
+    throw e;
   }
-};
+);
+ready.catch(() => {});
 
-let db = load();
-const remote = require('./store').attach('container', () => db, (d) => { db = d; });
-
-const save = () => {
-  remote.push();
+// Express 4 no captura rechazos de handlers async
+const h = (fn) => async (req, res) => {
   try {
-    fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+    await ready;
+    await fn(req, res);
   } catch (e) {
-    console.warn('[CONTAINER-SERVICE] No se pudo persistir en disco:', e.message);
+    console.error('[CONTAINER-SERVICE]', e.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Error interno de contenedores' });
   }
-};
-
-const findBox = (boxId) => db.smartboxes.find((b) => b.boxId === boxId);
-const nextBoxId = () => {
-  const max = db.smartboxes.reduce((m, b) => Math.max(m, parseInt(b.boxId.replace('SB-', ''), 10) || 0), 0);
-  return 'SB-' + String(max + 1).padStart(3, '0');
 };
 
 const boxSchema = {
@@ -141,21 +134,21 @@ const swaggerDocument = {
 
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
-app.get('/smartboxes', (req, res) => {
-  res.json(db.smartboxes);
-});
+app.get('/smartboxes', h(async (req, res) => {
+  res.json(await repo.list());
+}));
 
-app.get('/smartboxes/available', (req, res) => {
-  res.json(db.smartboxes.filter((b) => b.status === 'AVAILABLE' && b.batteryLevel >= LOW_BATTERY_THRESHOLD));
-});
+app.get('/smartboxes/available', h(async (req, res) => {
+  res.json(await repo.available(LOW_BATTERY_THRESHOLD));
+}));
 
-app.get('/smartboxes/:boxId', (req, res) => {
-  const box = findBox(req.params.boxId);
+app.get('/smartboxes/:boxId', h(async (req, res) => {
+  const box = await repo.find(req.params.boxId);
   if (!box) return res.status(404).json({ error: 'SmartBox no encontrada' });
   res.json(box);
-});
+}));
 
-app.post('/smartboxes', (req, res) => {
+app.post('/smartboxes', h(async (req, res) => {
   const { serialNumber, macAddress, maxWeightKg } = req.body || {};
   const errors = {};
   if (!serialNumber || !String(serialNumber).trim()) errors.serialNumber = 'Número de serie requerido';
@@ -164,46 +157,29 @@ app.post('/smartboxes', (req, res) => {
   if (!Number.isFinite(weight) || weight <= 0) errors.maxWeightKg = 'Peso máximo debe ser mayor a 0';
   if (Object.keys(errors).length) return res.status(400).json({ error: 'Datos inválidos', details: errors });
 
-  const serial = String(serialNumber).trim();
-  const mac = macAddress.toUpperCase();
-  if (db.smartboxes.some((b) => b.serialNumber === serial)) {
-    return res.status(409).json({ error: 'El número de serie ya está registrado' });
+  try {
+    res.status(201).json(await repo.create({ serialNumber: String(serialNumber).trim(), macAddress: macAddress.toUpperCase(), maxWeightKg: weight }));
+  } catch (e) {
+    if (e.code === 'SERIAL_TAKEN') return res.status(409).json({ error: 'El número de serie ya está registrado' });
+    if (e.code === 'MAC_TAKEN') return res.status(409).json({ error: 'La dirección MAC ya está registrada' });
+    throw e;
   }
-  if (db.smartboxes.some((b) => b.macAddress === mac)) {
-    return res.status(409).json({ error: 'La dirección MAC ya está registrada' });
-  }
+}));
 
-  const box = {
-    boxId: nextBoxId(),
-    serialNumber: serial,
-    macAddress: mac,
-    maxWeightKg: weight,
-    status: 'AVAILABLE',
-    deviceId: null,
-    batteryLevel: 100,
-    isOnline: false,
-    lastHeartbeat: null
-  };
-  db.smartboxes.push(box);
-  save();
-  res.status(201).json(box);
-});
-
-app.post('/smartboxes/:boxId/pair-device', (req, res) => {
-  const box = findBox(req.params.boxId);
-  if (!box) return res.status(404).json({ error: 'SmartBox no encontrada' });
+app.post('/smartboxes/:boxId/pair-device', h(async (req, res) => {
   const { deviceId } = req.body || {};
+  if (!(await repo.find(req.params.boxId))) return res.status(404).json({ error: 'SmartBox no encontrada' });
   if (!deviceId) return res.status(400).json({ error: 'deviceId requerido' });
-  const other = db.smartboxes.find((b) => b.deviceId === deviceId && b.boxId !== box.boxId);
-  if (other) return res.status(409).json({ error: `El dispositivo ya está emparejado con ${other.boxId}` });
+  try {
+    res.json(await repo.pairDevice(req.params.boxId, deviceId));
+  } catch (e) {
+    if (e.code === 'DEVICE_TAKEN') return res.status(409).json({ error: `El dispositivo ya está emparejado con ${e.other || 'otra caja'}` });
+    throw e;
+  }
+}));
 
-  box.deviceId = deviceId;
-  save();
-  res.json(box);
-});
-
-app.patch('/smartboxes/:boxId/status', (req, res) => {
-  const box = findBox(req.params.boxId);
+app.patch('/smartboxes/:boxId/status', h(async (req, res) => {
+  const box = await repo.find(req.params.boxId);
   if (!box) return res.status(404).json({ error: 'SmartBox no encontrada' });
   const { status } = req.body || {};
   if (!STATUSES.includes(status)) {
@@ -212,66 +188,30 @@ app.patch('/smartboxes/:boxId/status', (req, res) => {
   if (box.status === 'DECOMMISSIONED') {
     return res.status(400).json({ error: 'Una caja dada de baja no puede cambiar de estado' });
   }
-  box.status = status;
-  save();
-  res.json(box);
-});
+  res.json(await repo.setStatus(box.boxId, status));
+}));
 
-app.post('/devices/heartbeat', (req, res) => {
+app.post('/devices/heartbeat', h(async (req, res) => {
   const { boxId, deviceId, batteryLevel } = req.body || {};
-  const box = boxId ? findBox(boxId) : db.smartboxes.find((b) => deviceId && b.deviceId === deviceId);
-  if (!box) return res.status(404).json({ error: 'SmartBox o dispositivo no encontrado' });
-
   const level = Number(batteryLevel);
-  if (!Number.isFinite(level) || level < 0 || level > 100) {
+  if (batteryLevel === null || batteryLevel === undefined || !Number.isFinite(level) || level < 0 || level > 100) {
     return res.status(400).json({ error: 'batteryLevel debe estar entre 0 y 100' });
   }
+  if (!boxId && !deviceId) return res.status(400).json({ error: 'boxId o deviceId requerido' });
+  const result = await repo.heartbeat({ boxId, deviceId, batteryLevel: level, threshold: LOW_BATTERY_THRESHOLD });
+  if (!result) return res.status(404).json({ error: 'SmartBox o dispositivo no encontrado' });
+  res.json(result);
+}));
 
-  box.batteryLevel = level;
-  box.isOnline = true;
-  box.lastHeartbeat = new Date().toISOString();
+app.get('/alerts', h(async (req, res) => {
+  res.json(await repo.alerts());
+}));
 
-  let alert = null;
-  if (level < LOW_BATTERY_THRESHOLD) {
-    const open = db.alerts.find((a) => a.boxId === box.boxId && a.type === 'LOW_BATTERY' && !a.resolved);
-    if (open) {
-      open.batteryLevel = level;
-      open.timestamp = box.lastHeartbeat;
-      alert = open;
-    } else {
-      alert = {
-        alertId: 'ALT-BAT-' + Date.now(),
-        type: 'LOW_BATTERY',
-        severity: 'WARNING',
-        boxId: box.boxId,
-        batteryLevel: level,
-        resolved: false,
-        timestamp: box.lastHeartbeat
-      };
-      db.alerts.push(alert);
-    }
-  } else {
-    // Batería recuperada: cerrar alertas abiertas
-    db.alerts.forEach((a) => {
-      if (a.boxId === box.boxId && a.type === 'LOW_BATTERY' && !a.resolved) a.resolved = true;
-    });
-  }
-
-  save();
-  res.json({ smartBox: box, alert });
-});
-
-app.get('/alerts', (req, res) => {
-  res.json(db.alerts);
-});
-
-app.patch('/alerts/:alertId/resolve', (req, res) => {
-  const alert = db.alerts.find((a) => a.alertId === req.params.alertId);
+app.patch('/alerts/:alertId/resolve', h(async (req, res) => {
+  const alert = await repo.resolveAlert(req.params.alertId);
   if (!alert) return res.status(404).json({ error: 'Alerta no encontrada' });
-  alert.resolved = true;
-  save();
   res.json(alert);
-});
+}));
 
 app.get('/health', (req, res) => {
   res.json({ service: 'container-service', status: 'UP', timestamp: new Date().toISOString() });
