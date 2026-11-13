@@ -11,10 +11,14 @@ services:
       - IAM_SERVICE_URL=http://iam-service:3001
       - TELEMETRY_SERVICE_URL=http://telemetry-service:3002
       - CONTAINER_SERVICE_URL=http://container-service:3003
+      - SECURITY_SERVICE_URL=http://security-service:3004
+      - ORDERS_SERVICE_URL=http://orders-service:3005
     depends_on:
       - iam-service
       - telemetry-service
       - container-service
+      - security-service
+      - orders-service
     networks:
       - cold2hot-network
 
@@ -55,6 +59,23 @@ services:
       - "3004:3004"
     environment:
       - PORT=3004
+    networks:
+      - cold2hot-network
+
+  orders-service:
+    build: ./orders-service
+    container_name: cold2hot-orders-service
+    ports:
+      - "3005:3005"
+    environment:
+      - PORT=3005
+      - CONTAINER_SERVICE_URL=http://container-service:3003
+      - SECURITY_SERVICE_URL=http://security-service:3004
+      - TELEMETRY_SERVICE_URL=http://telemetry-service:3002
+    depends_on:
+      - container-service
+      - security-service
+      - telemetry-service
     networks:
       - cold2hot-network
 

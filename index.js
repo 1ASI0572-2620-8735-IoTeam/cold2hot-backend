@@ -10,6 +10,7 @@ const IAM_PORT = process.env.INTERNAL_IAM_PORT || 3001;
 const TELEMETRY_PORT = process.env.INTERNAL_TELEMETRY_PORT || 3002;
 const CONTAINER_PORT = process.env.INTERNAL_CONTAINER_PORT || 3003;
 const SECURITY_PORT = process.env.INTERNAL_SECURITY_PORT || 3004;
+const ORDERS_PORT = process.env.INTERNAL_ORDERS_PORT || 3005;
 const GATEWAY_PORT = process.env.PORT || 8080;
 
 console.log('====================================================');
@@ -36,7 +37,18 @@ const securityProcess = fork(path.join(__dirname, 'security-service', 'src', 'in
   env: { ...process.env, PORT: SECURITY_PORT }
 });
 
-// 5. Iniciar API Gateway perimetral tras inicialización de servicios
+// 5. Iniciar Microservicio de Envíos y Auditoría
+const ordersProcess = fork(path.join(__dirname, 'orders-service', 'src', 'index.js'), [], {
+  env: {
+    ...process.env,
+    PORT: ORDERS_PORT,
+    CONTAINER_SERVICE_URL: `http://127.0.0.1:${CONTAINER_PORT}`,
+    SECURITY_SERVICE_URL: `http://127.0.0.1:${SECURITY_PORT}`,
+    TELEMETRY_SERVICE_URL: `http://127.0.0.1:${TELEMETRY_PORT}`
+  }
+});
+
+// 6. Iniciar API Gateway perimetral tras inicialización de servicios
 setTimeout(() => {
   const gatewayProcess = fork(path.join(__dirname, 'api-gateway', 'src', 'index.js'), [], {
     env: {
@@ -45,7 +57,8 @@ setTimeout(() => {
       IAM_SERVICE_URL: `http://127.0.0.1:${IAM_PORT}`,
       TELEMETRY_SERVICE_URL: `http://127.0.0.1:${TELEMETRY_PORT}`,
       CONTAINER_SERVICE_URL: `http://127.0.0.1:${CONTAINER_PORT}`,
-      SECURITY_SERVICE_URL: `http://127.0.0.1:${SECURITY_PORT}`
+      SECURITY_SERVICE_URL: `http://127.0.0.1:${SECURITY_PORT}`,
+      ORDERS_SERVICE_URL: `http://127.0.0.1:${ORDERS_PORT}`
     }
   });
 
@@ -55,6 +68,7 @@ setTimeout(() => {
     try { telemetryProcess.kill(); } catch (e) {}
     try { containerProcess.kill(); } catch (e) {}
     try { securityProcess.kill(); } catch (e) {}
+    try { ordersProcess.kill(); } catch (e) {}
     try { gatewayProcess.kill(); } catch (e) {}
     process.exit(0);
   };
