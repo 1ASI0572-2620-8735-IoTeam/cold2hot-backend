@@ -205,6 +205,22 @@ app.get('/thermal-profiles/orders/:orderId', (req, res) => {
   res.json(profile);
 });
 
+// Aviso a security-service cuando cambia el estado de la tapa (apertura/cierre)
+const SECURITY_URL = process.env.SECURITY_SERVICE_URL || 'http://localhost:3004';
+const lastLid = {};
+const notifyLid = (smartBoxId, orderId, lidOpen) => {
+  if (lastLid[smartBoxId] === lidOpen || (lastLid[smartBoxId] === undefined && !lidOpen)) {
+    lastLid[smartBoxId] = lidOpen;
+    return;
+  }
+  lastLid[smartBoxId] = lidOpen;
+  fetch(`${SECURITY_URL}/tamper-events`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ smartBoxId, orderId, lidOpen })
+  }).catch(() => {});
+};
+
 // Ingesta + evaluación
 app.post('/ingest', (req, res) => {
   const { smartBoxId, shipmentId, temperature, lidOpen } = req.body || {};
@@ -226,6 +242,7 @@ app.post('/ingest', (req, res) => {
     timestamp: now()
   };
   db.logs.unshift(log);
+  notifyLid(smartBoxId, log.shipmentId === 'UNASSIGNED' ? null : log.shipmentId, !!lidOpen);
   if (db.logs.length > MAX_LOGS) db.logs.length = MAX_LOGS;
 
   let alert = null;

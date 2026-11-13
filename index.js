@@ -24,7 +24,7 @@ const iamProcess = fork(path.join(__dirname, 'iam-service', 'src', 'index.js'), 
 
 // 2. Iniciar Microservicio de Telemetría Térmica
 const telemetryProcess = fork(path.join(__dirname, 'telemetry-service', 'src', 'index.js'), [], {
-  env: { ...process.env, PORT: TELEMETRY_PORT }
+  env: { ...process.env, PORT: TELEMETRY_PORT, SECURITY_SERVICE_URL: `http://127.0.0.1:${SECURITY_PORT}` }
 });
 
 // 3. Iniciar Microservicio de Contenedores SmartBox y Dispositivos

@@ -40,6 +40,7 @@ services:
       - "3002:3002"
     environment:
       - PORT=3002
+      - SECURITY_SERVICE_URL=http://security-service:3004
     networks:
       - cold2hot-network
 
