@@ -14,8 +14,9 @@ const tick = async () => {
     for (const s of shipments) {
       const mid = (s.minTemp + s.maxTemp) / 2;
       const prev = temps[s.shipmentId] ?? mid;
-      // Deriva suave hacia afuera del rango para que ocasionalmente se genere un desvío
-      const next = Math.round((prev + (Math.random() - 0.52) * 1.2) * 10) / 10;
+      // Ruido con reversión a la media: casi siempre en rango y, de vez en cuando, un desvío
+      const spike = Math.random() < 0.03 ? (Math.random() < 0.5 ? -1 : 1) * (s.maxTemp - s.minTemp) * 0.8 : 0;
+      const next = Math.round((prev + (mid - prev) * 0.25 + (Math.random() - 0.5) * 1.2 + spike) * 10) / 10;
       temps[s.shipmentId] = next;
       await fetch(`${GATEWAY}/api/v1/telemetry/ingest`, {
         method: 'POST',
