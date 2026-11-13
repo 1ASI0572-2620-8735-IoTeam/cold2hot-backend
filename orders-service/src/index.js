@@ -164,15 +164,19 @@ const swaggerDocument = {
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 // Helpers de custodia
+// Alertas de security (aperturas) + telemetry (desvío térmico) de un envío
 const securityAlertsFor = async (orderId) => {
-  const r = await call(`${SECURITY_URL}/alerts?orderId=${encodeURIComponent(orderId)}`);
-  const r2 = await call(`${SECURITY_URL}/alerts?orderId=${encodeURIComponent('#' + orderId)}`);
-  return [...(r.ok ? r.data : []), ...(r2.ok ? r2.data : [])];
+  const [r, r2, t] = await Promise.all([
+    call(`${SECURITY_URL}/alerts?orderId=${encodeURIComponent(orderId)}`),
+    call(`${SECURITY_URL}/alerts?orderId=${encodeURIComponent('#' + orderId)}`),
+    call(`${TELEMETRY_URL}/alerts?orderId=${encodeURIComponent(orderId)}`)
+  ]);
+  return [...(r.ok ? r.data : []), ...(r2.ok ? r2.data : []), ...(t.ok ? t.data : [])];
 };
 
 const custodyStatus = (order, alerts = []) => {
   if (alerts.some((a) => a.type === 'UNAUTHORIZED_ACCESS') || order.incidents.includes('UNAUTHORIZED_ACCESS')) return 'UNAUTHORIZED_ACCESS';
-  if (order.incidents.includes('THERMAL_BREACH')) return 'THERMAL_BREACH';
+  if (alerts.some((a) => a.type === 'THERMAL_BREACH') || order.incidents.includes('THERMAL_BREACH')) return 'THERMAL_BREACH';
   return 'VERIFIED';
 };
 
@@ -248,8 +252,9 @@ app.post('/', async (req, res) => {
     deliveredAt: null
   };
 
-  // 2. Marcar la caja en tránsito y emitir OTP
+  // 2. Marcar la caja en tránsito, registrar perfil térmico y emitir OTP
   await call(`${CONTAINER_URL}/smartboxes/${encodeURIComponent(smartBoxId)}/status`, { method: 'PATCH', body: { status: 'IN_TRANSIT' } });
+  const tp = await call(`${TELEMETRY_URL}/thermal-profiles`, { method: 'POST', body: { orderId: order.orderId, smartBoxId, ...profile } });
   const otp = await call(`${SECURITY_URL}/otp`, { method: 'POST', body: { orderId: order.orderId, smartBoxId } });
 
   db.orders.push(order);
@@ -257,7 +262,7 @@ app.post('/', async (req, res) => {
   res.status(201).json({
     ...order,
     otp: otp.ok ? { code: otp.data.code, expiresAt: otp.data.expiresAt } : null,
-    warnings: [!box.ok && 'container-service no disponible: caja no validada', !otp.ok && 'security-service no disponible: OTP no emitido'].filter(Boolean)
+    warnings: [!box.ok && 'container-service no disponible: caja no validada', !otp.ok && 'security-service no disponible: OTP no emitido', !tp.ok && 'telemetry-service no disponible: perfil térmico no registrado'].filter(Boolean)
   });
 });
 
@@ -287,13 +292,13 @@ app.get('/analytics/operators', async (req, res) => {
 // Arma el reporte juntando datos de telemetry y security
 const buildAuditReport = async (order) => {
   const [telemetry, attempts, events, alerts] = await Promise.all([
-    call(`${TELEMETRY_URL}/logs`),
+    call(`${TELEMETRY_URL}/logs?orderId=${encodeURIComponent(order.orderId)}&limit=1000`),
     call(`${SECURITY_URL}/access-attempts?orderId=${encodeURIComponent(order.orderId)}`),
     call(`${SECURITY_URL}/tamper-events?orderId=${encodeURIComponent(order.orderId)}`),
     securityAlertsFor(order.orderId)
   ]);
   const logs = telemetry.ok ? telemetry.data.logs || [] : [];
-  const thermalHistory = logs.filter((l) => l.shipmentId === order.orderId || l.shipmentId === '#' + order.orderId);
+  const thermalHistory = logs.filter((l) => l.shipmentId === order.orderId || l.shipmentId === '#' + order.orderId).reverse();
 
   return {
     orderId: order.orderId,
