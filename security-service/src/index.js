@@ -26,8 +26,10 @@ const load = () => {
 };
 
 let db = load();
+const remote = require('./store').attach('security', () => db, (d) => { db = d; });
 
 const save = () => {
+  remote.push();
   try {
     fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
     fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
