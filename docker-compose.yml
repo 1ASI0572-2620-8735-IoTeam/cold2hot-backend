@@ -48,6 +48,16 @@ services:
     networks:
       - cold2hot-network
 
+  security-service:
+    build: ./security-service
+    container_name: cold2hot-security-service
+    ports:
+      - "3004:3004"
+    environment:
+      - PORT=3004
+    networks:
+      - cold2hot-network
+
 networks:
   cold2hot-network:
     driver: bridge
