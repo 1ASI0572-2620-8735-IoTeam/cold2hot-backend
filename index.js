@@ -19,7 +19,7 @@ console.log('====================================================');
 
 // 1. Iniciar Microservicio IAM (Identidad y Accesos)
 const iamProcess = fork(path.join(__dirname, 'iam-service', 'src', 'index.js'), [], {
-  env: { ...process.env, PORT: IAM_PORT }
+  env: { ...process.env, PORT: IAM_PORT, CONTAINER_SERVICE_URL: `http://127.0.0.1:${CONTAINER_PORT}` }
 });
 
 // 2. Iniciar Microservicio de Telemetría Térmica
