@@ -8,6 +8,7 @@ const path = require('path');
 
 const IAM_PORT = process.env.INTERNAL_IAM_PORT || 3001;
 const TELEMETRY_PORT = process.env.INTERNAL_TELEMETRY_PORT || 3002;
+const CONTAINER_PORT = process.env.INTERNAL_CONTAINER_PORT || 3003;
 const GATEWAY_PORT = process.env.PORT || 8080;
 
 console.log('====================================================');
@@ -24,14 +25,20 @@ const telemetryProcess = fork(path.join(__dirname, 'telemetry-service', 'src', '
   env: { ...process.env, PORT: TELEMETRY_PORT }
 });
 
-// 3. Iniciar API Gateway perimetral tras inicialización de servicios
+// 3. Iniciar Microservicio de Contenedores SmartBox y Dispositivos
+const containerProcess = fork(path.join(__dirname, 'container-service', 'src', 'index.js'), [], {
+  env: { ...process.env, PORT: CONTAINER_PORT }
+});
+
+// 4. Iniciar API Gateway perimetral tras inicialización de servicios
 setTimeout(() => {
   const gatewayProcess = fork(path.join(__dirname, 'api-gateway', 'src', 'index.js'), [], {
     env: {
       ...process.env,
       PORT: GATEWAY_PORT,
       IAM_SERVICE_URL: `http://127.0.0.1:${IAM_PORT}`,
-      TELEMETRY_SERVICE_URL: `http://127.0.0.1:${TELEMETRY_PORT}`
+      TELEMETRY_SERVICE_URL: `http://127.0.0.1:${TELEMETRY_PORT}`,
+      CONTAINER_SERVICE_URL: `http://127.0.0.1:${CONTAINER_PORT}`
     }
   });
 
@@ -39,6 +46,7 @@ setTimeout(() => {
     console.log('[ORCHESTRATOR] Deteniendo microservicios...');
     try { iamProcess.kill(); } catch (e) {}
     try { telemetryProcess.kill(); } catch (e) {}
+    try { containerProcess.kill(); } catch (e) {}
     try { gatewayProcess.kill(); } catch (e) {}
     process.exit(0);
   };
